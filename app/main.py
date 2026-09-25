@@ -10,9 +10,14 @@
 - 预约水深复核：按查询时最新预报复算预约排定通航区间的水深，合并返回
   欠深时段及各段最大欠深；预报未覆盖整个通航区间时明确返回未覆盖时段，
   不判为安全；复核只读，不改动预约或原排程。
+- 最大可通航吃水查询：提交安全富余、正数通航分钟数与允许出发起止时刻，
+  按查询时最新潮高预报与线性插值规则，求允许范围内全程水深达标的最大
+  非负吃水（按 0.01 米向下取整）；同一吃水多个可行时刻时返回最早出发及
+  通航结束时刻；范围内无可行的 0 米吃水时返回 409。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+import math
 
 from fastapi import Depends, FastAPI, HTTPException
 from sqlite3 import Connection
@@ -23,6 +28,8 @@ from .schemas import (
     DepthAuditDeficit,
     DepthAuditResult,
     DepthAuditUncovered,
+    MaxDraftQuery,
+    MaxDraftResult,
     PortCreate,
     PortOut,
     PortUpdate,
@@ -33,7 +40,13 @@ from .schemas import (
     WindowQuery,
     WindowQueryResult,
 )
-from .tides import departure_windows, depth_deficit_audit, earliest_scheduled_departure
+from .tides import (
+    departure_windows,
+    depth_deficit_audit,
+    earliest_feasible_departure,
+    earliest_scheduled_departure,
+    max_supported_required_depth,
+)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -43,7 +56,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -176,6 +189,74 @@ def query_windows(port_id: int, payload: WindowQuery, db: Connection = Depends(g
         duration_minutes=payload.duration_minutes,
         earliest_departure=earliest,
         windows=[DepartureWindow(start=s, end=e) for s, e in windows],
+    )
+
+
+@app.post("/ports/{port_id}/max-draft", response_model=MaxDraftResult)
+def query_max_draft(port_id: int, payload: MaxDraftQuery, db: Connection = Depends(get_db)):
+    """最大可通航吃水查询（只读，不写库）。
+
+    提交安全富余、正数通航分钟数与允许出发起止时刻，按查询时最新潮高预报
+    与相邻点线性插值规则，求允许范围内全程水深（基准水深 + 潮高）达标的
+    最大非负吃水，结果按 0.01 米向下取整；同一吃水有多个可行时刻时返回
+    最早出发及通航结束时刻。只在预报覆盖的连续时段内求解；允许范围内连
+    0 米吃水都不可行时返回 409。
+    """
+    port = _get_port_or_404(db, port_id)
+    points = _forecast_points(db, port_id)
+    allowed_from = _normalize(payload.allowed_departure_from)
+    allowed_to = _normalize(payload.allowed_departure_to)
+    duration_seconds = payload.duration_minutes * 60
+
+    supported, feasible = max_supported_required_depth(
+        points,
+        reference_depth=port["reference_depth"],
+        min_required=payload.safety_margin,  # 对应 0 米吃水
+        duration_seconds=duration_seconds,
+        allowed_start=allowed_from,
+        allowed_end=allowed_to,
+    )
+    if feasible is None:
+        raise HTTPException(
+            status_code=409,
+            detail="允许出发范围内无可行的 0 米吃水（预报未覆盖或水深不足）",
+        )
+
+    # 按 0.01 米向下取整；微小 epsilon 抵消二分与插值的浮点噪声，
+    # 保证真实值恰在厘米刻度时不会被误向下取一档
+    max_draft = round(
+        math.floor((supported - payload.safety_margin) * 100 + 1e-9) / 100, 2
+    )
+    required_depth = max_draft + payload.safety_margin
+    departure = earliest_feasible_departure(
+        points,
+        reference_depth=port["reference_depth"],
+        required_depth=required_depth,
+        duration_seconds=duration_seconds,
+        allowed_start=allowed_from,
+        allowed_end=allowed_to,
+    )
+    if departure is None:  # 浮点取整边界兜底：退一档后必然可行
+        max_draft = round(max_draft - 0.01, 2)
+        required_depth = max_draft + payload.safety_margin
+        departure = earliest_feasible_departure(
+            points,
+            reference_depth=port["reference_depth"],
+            required_depth=required_depth,
+            duration_seconds=duration_seconds,
+            allowed_start=allowed_from,
+            allowed_end=allowed_to,
+        )
+    return MaxDraftResult(
+        port_id=port_id,
+        safety_margin=payload.safety_margin,
+        duration_minutes=payload.duration_minutes,
+        allowed_departure_from=allowed_from,
+        allowed_departure_to=allowed_to,
+        max_draft=max_draft,
+        required_depth=required_depth,
+        departure_start=departure,
+        departure_end=departure + timedelta(seconds=duration_seconds),
     )
 
 

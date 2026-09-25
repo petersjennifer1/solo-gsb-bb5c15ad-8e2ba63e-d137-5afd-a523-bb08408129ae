@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 from app.tides import (
     departure_windows,
     depth_deficit_audit,
+    earliest_feasible_departure,
     earliest_scheduled_departure,
+    max_supported_required_depth,
     sufficient_depth_windows,
 )
 
@@ -321,3 +323,84 @@ def test_audit_deficit_stops_at_forecast_coverage_edge():
     )
     assert deficits == [(BASE, BASE + timedelta(hours=1), 1.0)]
     assert uncovered == [(BASE + timedelta(hours=1), BASE + timedelta(hours=2))]
+
+
+# ---------------------------------------------------------------------------
+# earliest_feasible_departure / max_supported_required_depth：最大可通航吃水
+# ---------------------------------------------------------------------------
+
+
+def test_earliest_feasible_departure_intersects_allowed_range():
+    # 与 /windows 相同的可出发时段 [00:30, 01:00]，允许范围从 00:45 起 → 00:45
+    dep = earliest_feasible_departure(
+        pts(1, 3, 1), reference_depth=3.0, required_depth=5.0, duration_seconds=1800,
+        allowed_start=BASE + timedelta(minutes=45),
+        allowed_end=BASE + timedelta(hours=2),
+    )
+    assert dep == BASE + timedelta(minutes=45)
+
+
+def test_earliest_feasible_departure_none_outside_coverage():
+    # 允许范围完全在预报覆盖时段之外 → 无可行时刻
+    dep = earliest_feasible_departure(
+        pts(1, 3, 1), reference_depth=3.0, required_depth=5.0, duration_seconds=1800,
+        allowed_start=BASE + timedelta(hours=3),
+        allowed_end=BASE + timedelta(hours=4),
+    )
+    assert dep is None
+
+
+def test_max_supported_required_depth_centered_on_high_tide():
+    # 基准 4.0，潮高 1→3→1（00:00/02:00/04:00）：水深 5→7→5
+    # 60 分钟通航的最优区间为以高潮为中心的 [01:30, 02:30]，两端水深 6.5
+    supported, departure = max_supported_required_depth(
+        pts(1, 3, 1, step_minutes=120), reference_depth=4.0, min_required=0.5,
+        duration_seconds=3600,
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=4),
+    )
+    assert abs(supported - 6.5) < 1e-6
+    assert departure == BASE + timedelta(hours=1, minutes=30)
+
+
+def test_max_supported_required_depth_flat_tide_exact():
+    # 全程水深恒为 5.0：最大所需水深恰为 5.0，不得因浮点噪声退档
+    supported, departure = max_supported_required_depth(
+        pts(2, 2), reference_depth=3.0, min_required=0.0,
+        duration_seconds=1800,
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=1),
+    )
+    assert abs(supported - 5.0) < 1e-6
+    assert departure == BASE
+
+
+def test_max_supported_required_depth_respects_allowed_range():
+    # 只允许 00:00–01:00 出发：最优 01:00 出发，[01:00, 02:00] 最低水深 6.0
+    supported, departure = max_supported_required_depth(
+        pts(1, 3, 1, step_minutes=120), reference_depth=4.0, min_required=0.5,
+        duration_seconds=3600,
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=1),
+    )
+    assert abs(supported - 6.0) < 1e-6
+    assert departure == BASE + timedelta(hours=1)
+
+
+def test_max_supported_required_depth_infeasible_returns_none():
+    # 允许范围在预报覆盖之外，连 min_required（0 米吃水）也不可行
+    supported, departure = max_supported_required_depth(
+        pts(1, 3, 1), reference_depth=4.0, min_required=0.5,
+        duration_seconds=3600,
+        allowed_start=BASE + timedelta(hours=5),
+        allowed_end=BASE + timedelta(hours=6),
+    )
+    assert supported == 0.5
+    assert departure is None
+
+
+def test_max_supported_required_depth_duration_exceeds_coverage():
+    # 通航时长超过预报覆盖时长 → 任何吃水都不可行
+    _, departure = max_supported_required_depth(
+        pts(3, 3), reference_depth=4.0, min_required=0.0,
+        duration_seconds=7200,  # 覆盖仅 60 分钟
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=1),
+    )
+    assert departure is None

@@ -69,6 +69,41 @@ class WindowQueryResult(BaseModel):
     windows: list[DepartureWindow] = Field(description="全部可出发时段")
 
 
+class MaxDraftQuery(BaseModel):
+    """最大可通航吃水查询：提交安全富余、正数通航分钟数与允许出发起止时刻。"""
+
+    safety_margin: float = Field(ge=0, description="安全富余（米）")
+    duration_minutes: float = Field(gt=0, description="所需通航时长（分钟），必须为正数")
+    allowed_departure_from: datetime = Field(description="允许出发范围起点（ISO 8601；无时区信息按 UTC）")
+    allowed_departure_to: datetime = Field(description="允许出发范围终点（ISO 8601；无时区信息按 UTC）")
+
+    @model_validator(mode="after")
+    def _validate_range(self):
+        start = self.allowed_departure_from
+        end = self.allowed_departure_to
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start > end:
+            raise ValueError("allowed_departure_from 不得晚于 allowed_departure_to")
+        return self
+
+
+class MaxDraftResult(BaseModel):
+    port_id: int
+    safety_margin: float = Field(description="安全富余（米）")
+    duration_minutes: float
+    allowed_departure_from: UtcDatetime = Field(description="请求的允许出发范围起点")
+    allowed_departure_to: UtcDatetime = Field(description="请求的允许出发范围终点")
+    max_draft: float = Field(
+        description="允许范围内全程水深达标的最大非负吃水（米，按 0.01 米向下取整）"
+    )
+    required_depth: float = Field(description="对应所需水深 = 最大吃水 + 安全富余（米）")
+    departure_start: UtcDatetime = Field(description="该吃水下最早可行出发时刻")
+    departure_end: UtcDatetime = Field(description="通航结束时刻 = 出发时刻 + 通航时长")
+
+
 class ReservationCreate(BaseModel):
     ship_name: str = Field(min_length=1, max_length=100, description="船名")
     draft: float = Field(ge=0, description="船舶吃水（米）")

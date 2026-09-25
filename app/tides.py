@@ -8,6 +8,9 @@
 - 可出发时段 = [窗口起点, 窗口终点 − 通航时长]；窗口长度不足通航时长的舍弃；
 - 预约水深复核：在排定通航区间内求水深低于所需水深的连续时段（相邻段合并，
   附各段最大欠深）；预报首末点未覆盖的通航时段单独返回，不得视为安全。
+- 最大可通航吃水：在允许出发范围内，对“所需水深 = 吃水 + 安全富余”二分搜索，
+  复用达标窗口/可出发时段规则判定可行性，求允许范围内全程水深达标所能支持的
+  最大所需水深；吃水 = 最大所需水深 − 安全富余，由调用方按 0.01 米向下取整。
 """
 from __future__ import annotations
 
@@ -95,6 +98,77 @@ def departure_windows(
             result.append((_to_utc(start_ts), _to_utc(end_ts - duration_seconds)))
     earliest = min((w[0] for w in result), default=None)
     return result, earliest
+
+
+def earliest_feasible_departure(
+    points: list[ForecastPoint],
+    reference_depth: float,
+    required_depth: float,
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+) -> datetime | None:
+    """某所需水深下，允许出发范围 [allowed_start, allowed_end] 内的最早可行出发时刻。
+
+    复用 sufficient_depth_windows 的插值规则求达标窗口（已限定在预报覆盖
+    时段内），减通航时长得到可出发时段后再与允许出发范围取交集。交集在
+    原始（Unix 秒）时间轴上完成，避免整秒取整把可行性边界外扩；仅返回的
+    展示时刻按既有约定四舍五入到整秒。无可行时刻返回 None。
+    """
+    lo, hi = allowed_start.timestamp(), allowed_end.timestamp()
+    feasible: list[float] = []
+    for start_ts, end_ts in sufficient_depth_windows(
+        points, reference_depth, required_depth
+    ):
+        if end_ts - start_ts >= duration_seconds - _EPS:
+            departure = max(start_ts, lo)
+            if departure <= min(end_ts - duration_seconds, hi) + _EPS:
+                feasible.append(departure)
+    return _to_utc(min(feasible)) if feasible else None
+
+
+def max_supported_required_depth(
+    points: list[ForecastPoint],
+    reference_depth: float,
+    min_required: float,
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+) -> tuple[float, datetime | None]:
+    """允许出发范围内全程水深达标所能支持的最大所需水深（二分搜索）。
+
+    可行性关于所需水深单调：所需水深越低越容易找到可行出发时刻。
+    返回 (最大所需水深, 该水深下的最早可行出发时刻)；
+    连 min_required（对应 0 米吃水 + 安全富余）都不可行时返回 (min_required, None)。
+    """
+    if (
+        earliest_feasible_departure(
+            points, reference_depth, min_required,
+            duration_seconds, allowed_start, allowed_end,
+        )
+        is None
+    ):
+        return min_required, None
+
+    # 上界取预报覆盖时段内的峰值水深：更高的所需水深必然不可行
+    lo = min_required
+    hi = max((reference_depth + h for _, h in points), default=min_required)
+    for _ in range(80):  # 80 次二分，精度远超 0.01 米取整所需
+        mid = (lo + hi) / 2
+        if (
+            earliest_feasible_departure(
+                points, reference_depth, mid,
+                duration_seconds, allowed_start, allowed_end,
+            )
+            is not None
+        ):
+            lo = mid
+        else:
+            hi = mid
+    departure = earliest_feasible_departure(
+        points, reference_depth, lo, duration_seconds, allowed_start, allowed_end
+    )
+    return lo, departure
 
 
 def earliest_scheduled_departure(
