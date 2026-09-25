@@ -7,11 +7,14 @@
 - 水深 >= 吃水 + 安全富余 的连续时段为达标窗口，端点恰好达标也纳入；
 - 可出发时段 = [窗口起点, 窗口终点 − 通航时长]；窗口长度不足通航时长的舍弃；
 - 预约水深复核：在排定通航区间内求水深低于所需水深的连续时段（相邻段合并，
-  附各段最大欠深）；预报首末点未覆盖的通航时段单独返回，不得视为安全。
+  附各段最大欠深）；预报首末点未覆盖的通航时段单独返回，不得视为安全；
+- 最大可通航吃水：在允许出发范围内求全程水深达标的最大非负吃水
+  （可行性随吃水单调，二分求解；结果按 0.01 米向下取整）。
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 
 _EPS = 1e-9  # 浮点容差，保证“恰好达标”的端点被纳入
 
@@ -142,6 +145,69 @@ def earliest_scheduled_departure(
     if not candidates:
         return None
     return _to_utc(min(lo for lo, _ in candidates))
+
+
+def max_navigable_draft(
+    points: list[ForecastPoint],
+    reference_depth: float,
+    safety_margin: float,
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+) -> tuple[float, datetime, datetime] | None:
+    """求允许出发范围内、全程水深达标的最大非负吃水。
+
+    吃水 d 可行 ⟺ 存在出发时刻 t ∈ [allowed_start, allowed_end]，使整个通航
+    区间 [t, t+时长] 水深 >= d + safety_margin（沿用 departure_windows 的
+    线性插值与“只在预报覆盖时段内求解”规则）。可行性随吃水单调递减，
+    二分逼近真实最大值后按 0.01 米向下取整。
+
+    返回 (max_draft, departure_start, departure_end)：
+    - max_draft：最大非负吃水（米），按 0.01 米向下取整；
+    - departure_start / departure_end：该吃水下最早的出发时刻与通航结束时刻
+      （同一吃水有多个可行时刻时取最早）。
+    允许范围内无可行的 0 米吃水（含预报未覆盖）时返回 None。
+    """
+    lo_ts = allowed_start.timestamp()
+    hi_ts = allowed_end.timestamp()
+
+    def feasible(draft: float) -> bool:
+        windows, _ = departure_windows(
+            points, reference_depth, draft + safety_margin, duration_seconds
+        )
+        # 可出发时段 [s, e] 与允许出发范围 [lo_ts, hi_ts] 有交集即可行
+        return any(
+            start.timestamp() <= hi_ts and end.timestamp() >= lo_ts
+            for start, end in windows
+        )
+
+    if not feasible(0.0):
+        return None
+
+    # 上界：吃水不可能超过“覆盖时段内最高水深 − 安全富余”
+    lo, hi = 0.0, max(reference_depth + h for _, h in points) - safety_margin
+    for _ in range(60):  # 60 次二分后误差远小于 0.01 米
+        mid = (lo + hi) / 2
+        if feasible(mid):
+            lo = mid
+        else:
+            hi = mid
+
+    # 向下取整到 0.01 米：lo 可行但可能略低于相邻上一格，先试探上一格再定
+    cents = max(0, math.floor(lo * 100 + _EPS))
+    if feasible((cents + 1) / 100):
+        cents += 1
+    max_draft = cents / 100
+
+    windows, _ = departure_windows(
+        points, reference_depth, max_draft + safety_margin, duration_seconds
+    )
+    departure = earliest_scheduled_departure(
+        windows, duration_seconds, allowed_start, allowed_end, blockers=[]
+    )
+    if departure is None:  # 理论上不可达（max_draft 已验证可行），防御性处理
+        return None
+    return max_draft, departure, departure + timedelta(seconds=duration_seconds)
 
 
 def depth_deficit_audit(

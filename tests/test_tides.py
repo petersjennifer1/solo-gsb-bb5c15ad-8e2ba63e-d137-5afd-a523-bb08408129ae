@@ -5,6 +5,7 @@ from app.tides import (
     departure_windows,
     depth_deficit_audit,
     earliest_scheduled_departure,
+    max_navigable_draft,
     sufficient_depth_windows,
 )
 
@@ -211,6 +212,111 @@ def test_schedule_range_touching_tide_window_endpoint_allowed():
         [],
     )
     assert dep == BASE + timedelta(hours=4)
+
+
+# ---------------------------------------------------------------------------
+# max_navigable_draft：允许范围内全程水深达标的最大非负吃水
+# ---------------------------------------------------------------------------
+
+
+def test_max_draft_single_tide_cycle():
+    # 基准 4.5，潮高 0.5→3.0→0.5（3 小时间隔）：最佳 60 分钟通航窗口
+    # [02:30, 03:30]，窗口内最低水深 4.5+0.5+(2.5/3)*2.5 = 85/12 ≈ 7.0833
+    # → 最大吃水 79/12 ≈ 6.5833，向下取整 6.58
+    result = max_navigable_draft(
+        pts(0.5, 3.0, 0.5, step_minutes=180),
+        reference_depth=4.5, safety_margin=0.5, duration_seconds=3600,
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=6),
+    )
+    assert result is not None
+    max_draft, dep_start, dep_end = result
+    assert max_draft == 6.58
+    # 吃水 6.58 → 要求水深 7.08（潮高 >= 2.58），达标窗口 [02:29:45.6, 03:30:14.4]，
+    # 可出发 [02:29:45.6, 02:30:14.4]，最早出发取整秒 02:29:46
+    assert dep_start == BASE + timedelta(hours=2, minutes=29, seconds=46)
+    assert dep_end == BASE + timedelta(hours=3, minutes=29, seconds=46)
+
+
+def test_max_draft_rounded_down_to_cent():
+    # 峰值水深 4.5 + 2.95 = 7.45；最佳窗口 [02:30, 03:30] 最低水深
+    # 4.5 + 2.95*2.5/3 = 6.95833… → 向下取整 6.95（而非 6.96）
+    result = max_navigable_draft(
+        pts(0.0, 2.95, 0.0, step_minutes=180),
+        reference_depth=4.5, safety_margin=0.0, duration_seconds=3600,
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=6),
+    )
+    assert result[0] == 6.95
+
+
+def test_max_draft_exact_cent_kept():
+    # 真实最大值恰好落在 0.01 米的整数倍（7.00）时不得少算成 6.99
+    result = max_navigable_draft(
+        pts(0.0, 3.0, 0.0, step_minutes=180),
+        reference_depth=4.5, safety_margin=0.0, duration_seconds=3600,
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=6),
+    )
+    assert result[0] == 7.0
+
+
+def test_max_draft_zero_when_only_zero_feasible():
+    # 只允许 00:00 出发：通航 [00:00, 01:00] 最低水深 5.0 = 安全富余
+    # → 0 米吃水恰好可行，最大吃水为 0
+    result = max_navigable_draft(
+        pts(0.5, 3.0, 0.5, step_minutes=180),
+        reference_depth=4.5, safety_margin=5.0, duration_seconds=3600,
+        allowed_start=BASE, allowed_end=BASE,
+    )
+    assert result is not None
+    assert result[0] == 0.0
+    assert result[1] == BASE
+    assert result[2] == BASE + timedelta(hours=1)
+
+
+def test_max_draft_earliest_departure_among_multiple_windows():
+    # 两个相同高潮窗口：同一最大吃水 6.58 在两个窗口都可行，取最早出发
+    result = max_navigable_draft(
+        pts(0.5, 3.0, 0.5, 3.0, 0.5, step_minutes=180),
+        reference_depth=4.5, safety_margin=0.5, duration_seconds=3600,
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=12),
+    )
+    assert result[0] == 6.58
+    assert result[1] == BASE + timedelta(hours=2, minutes=29, seconds=46)
+    assert result[2] == BASE + timedelta(hours=3, minutes=29, seconds=46)
+
+
+def test_max_draft_limited_by_allowed_range():
+    # 只允许 00:00–01:00 出发：最佳为 01:00 出发，通航 [01:00, 02:00]
+    # 最低水深 = 01:00 处 4.5 + 0.5 + 2.5/3 = 5.8333… → 5.83 − 0.5 → 5.33
+    result = max_navigable_draft(
+        pts(0.5, 3.0, 0.5, step_minutes=180),
+        reference_depth=4.5, safety_margin=0.5, duration_seconds=3600,
+        allowed_start=BASE, allowed_end=BASE + timedelta(hours=1),
+    )
+    assert result[0] == 5.33
+    # 取整后的 5.33 在 00:59:46 起即可行（要求水深 5.83，潮高 >= 1.33）
+    assert result[1] == BASE + timedelta(minutes=59, seconds=46)
+    assert result[2] == result[1] + timedelta(hours=1)
+
+
+def test_max_draft_infeasible_returns_none():
+    points = pts(0.5, 3.0, 0.5, step_minutes=180)
+    # 安全富余超过最高水深 7.5
+    assert max_navigable_draft(
+        points, 4.5, 8.0, 3600, BASE, BASE + timedelta(hours=6)
+    ) is None
+    # 允许范围不在预报覆盖时段内
+    assert max_navigable_draft(
+        points, 4.5, 0.5, 3600,
+        BASE + timedelta(hours=7), BASE + timedelta(hours=8),
+    ) is None
+    # 预报点不足 2 个，无插值区间
+    assert max_navigable_draft(
+        pts(3.0), 4.5, 0.5, 3600, BASE, BASE + timedelta(hours=6)
+    ) is None
+    # 通航时长超过预报覆盖的任何窗口
+    assert max_navigable_draft(
+        points, 4.5, 0.5, 7 * 3600, BASE, BASE + timedelta(hours=6)
+    ) is None
 
 
 # ---------------------------------------------------------------------------

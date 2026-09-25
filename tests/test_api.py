@@ -99,6 +99,136 @@ def test_no_forecasts_returns_empty(client):
 
 
 # ---------------------------------------------------------------------------
+# 最大可通航吃水查询 POST /ports/{id}/max-draft
+# ---------------------------------------------------------------------------
+
+# 示例港：基准 4.5，潮高 0.5→3.0→0.5（00:00/03:00/06:00）
+MAX_DRAFT_BODY = {
+    "safety_margin": 0.5,
+    "duration_minutes": 60,
+    "allowed_departure_from": "2026-09-24T00:00:00Z",
+    "allowed_departure_to": "2026-09-24T06:00:00Z",
+}
+
+
+def test_max_draft_query_basic(client):
+    port_id = _setup_port(client)
+    r = client.post(f"/ports/{port_id}/max-draft", json=MAX_DRAFT_BODY)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["port_id"] == port_id
+    assert body["safety_margin"] == 0.5
+    assert body["duration_minutes"] == 60.0
+    # 最佳 60 分钟通航窗口 [02:30, 03:30]，最低水深 85/12 ≈ 7.0833
+    # → 真实最大吃水 6.5833…，按 0.01 米向下取整为 6.58
+    assert body["max_draft"] == 6.58
+    assert body["required_depth"] == 7.08
+    # 该吃水下达标窗口 [02:29:45.6, 03:30:14.4]，最早 02:29:46 出发
+    assert body["departure_start"] == "2026-09-24T02:29:46+00:00"
+    assert body["departure_end"] == "2026-09-24T03:29:46+00:00"
+
+
+def test_max_draft_rounded_down_to_cent(client):
+    # 峰值潮高 2.95：最大吃水 4.5 + 2.95*2.5/3 − 0 = 6.95833… → 6.95
+    r = client.post("/ports", json={"name": "取整港", "reference_depth": 4.5})
+    port_id = r.json()["id"]
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 0.0},
+            {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 2.95},
+            {"forecast_time": "2026-09-24T06:00:00Z", "tide_height": 0.0},
+        ]},
+    )
+    r = client.post(
+        f"/ports/{port_id}/max-draft", json={**MAX_DRAFT_BODY, "safety_margin": 0.0}
+    )
+    assert r.status_code == 200
+    assert r.json()["max_draft"] == 6.95
+
+
+def test_max_draft_uses_latest_forecast(client):
+    port_id = _setup_port(client)
+    # 更正高潮预报点 3.0 → 1.0：最佳窗口 [02:30, 03:30] 最低水深
+    # 4.5 + 0.9166… = 5.4166… → 最大吃水 4.9166… → 4.91
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]},
+    )
+    r = client.post(f"/ports/{port_id}/max-draft", json=MAX_DRAFT_BODY)
+    assert r.status_code == 200
+    assert r.json()["max_draft"] == 4.91
+
+
+def test_max_draft_respects_allowed_range(client):
+    port_id = _setup_port(client)
+    # 只允许 01:00 前出发：最佳 01:00 出发，最低水深 5.8333… → 5.33
+    body = {**MAX_DRAFT_BODY, "allowed_departure_to": "2026-09-24T01:00:00Z"}
+    r = client.post(f"/ports/{port_id}/max-draft", json=body)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["max_draft"] == 5.33
+    assert body["departure_start"] == "2026-09-24T00:59:46+00:00"
+    assert body["departure_end"] == "2026-09-24T01:59:46+00:00"
+
+
+def test_max_draft_409_when_no_feasible_zero_draft(client):
+    port_id = _setup_port(client)
+    # 安全富余超过最高水深 7.5
+    body = {**MAX_DRAFT_BODY, "safety_margin": 8.0}
+    assert client.post(f"/ports/{port_id}/max-draft", json=body).status_code == 409
+    # 允许出发范围不在预报覆盖时段内
+    body = {
+        **MAX_DRAFT_BODY,
+        "allowed_departure_from": "2026-09-24T07:00:00Z",
+        "allowed_departure_to": "2026-09-24T08:00:00Z",
+    }
+    assert client.post(f"/ports/{port_id}/max-draft", json=body).status_code == 409
+    # 通航时长超过预报覆盖的任何窗口
+    body = {**MAX_DRAFT_BODY, "duration_minutes": 7 * 60}
+    assert client.post(f"/ports/{port_id}/max-draft", json=body).status_code == 409
+
+
+def test_max_draft_no_forecasts_409(client):
+    r = client.post("/ports", json={"name": "空港", "reference_depth": 10.0})
+    port_id = r.json()["id"]
+    assert client.post(f"/ports/{port_id}/max-draft", json=MAX_DRAFT_BODY).status_code == 409
+
+
+def test_max_draft_validation_errors(client):
+    port_id = _setup_port(client)
+    # 通航时长非正 → 422
+    assert client.post(
+        f"/ports/{port_id}/max-draft", json={**MAX_DRAFT_BODY, "duration_minutes": 0}
+    ).status_code == 422
+    # 安全富余为负 → 422
+    assert client.post(
+        f"/ports/{port_id}/max-draft", json={**MAX_DRAFT_BODY, "safety_margin": -0.1}
+    ).status_code == 422
+    # 允许出发范围起止颠倒 → 422
+    bad_range = {
+        **MAX_DRAFT_BODY,
+        "allowed_departure_from": "2026-09-24T06:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:00:00Z",
+    }
+    assert client.post(f"/ports/{port_id}/max-draft", json=bad_range).status_code == 422
+    # 未知港口 → 404
+    assert client.post("/ports/999/max-draft", json=MAX_DRAFT_BODY).status_code == 404
+
+
+def test_max_draft_naive_datetime_treated_as_utc(client):
+    port_id = _setup_port(client)
+    body = {
+        **MAX_DRAFT_BODY,
+        "allowed_departure_from": "2026-09-24T00:00:00",   # 无时区 → UTC
+        "allowed_departure_to": "2026-09-24T06:00:00",
+    }
+    r = client.post(f"/ports/{port_id}/max-draft", json=body)
+    assert r.status_code == 200
+    assert r.json()["max_draft"] == 6.58
+
+
+# ---------------------------------------------------------------------------
 # 单向航道预约
 # ---------------------------------------------------------------------------
 
